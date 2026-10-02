@@ -1,0 +1,86 @@
+FLASHBACK MOBILE — MASTER TODO
+Base: Flashback 0.39.9 (upstream 1.21.11 branch) + phone patches. Jar: Flashback-0.39.9-mobile-for-MC1.21.11.jar
+Target launchers: Mojo / Pojav / Zenith / CraftStudio (Android arm64/x86_64, JRE 21, MC 1.21.11).
+
+LEGEND: [x] done  [ ] todo  [!] blocked/notes
+
+=== SHIPPED (mobile jar, BUILD SUCCESSFUL) ===
+[x] Java 21 toolchain (Pojav JRE21 loads it)
+[x] MobileCompat detection (pojav.path.minecraft, android.os.Build, /system/build.prop)
+[x] NFD dialogs fallback (auto paths under flashback_exports/, no crash)
+[x] ImGui editor auto-disable on missing ARM natives (no more nInitJni crash)
+[x] FFmpeg video fallback (PNG sequence when natives missing)
+[x] /flashback export_mobile (1080p60 lossless PNG, no editor needed)
+[x] Mobile config defaults (1080p60 cap, no SSAA, no audio, default export path)
+[x] Unsafe null-safe + Taskbar JNA reflection (no ART verify crash)
+[x] TempFolderProvider ProcessHandle guards + gameDir temp paths
+[x] Bundled ffmpeg extraction (arm64-v8a/x86_64 from own jar) + libx264->mpeg4 auto MP4
+[x] LD_LIBRARY_PATH for bundled ffmpeg child process
+[x] POV answer: not recorded in 0.39.x (editor forces first-person)
+[x] Inventory answers: slot changes + hotbar items recorded behind recordHotbar=false;
+    swing + use-poses covered via AnimatePacket + entity data; own-inventory OPEN screen not recorded
+
+=== PHASE 1 — Vanilla export screen (touch UI, no ImGui) ===
+[x] MobileExportScreen (screen/MobileExportScreen.java): resolution 720p/1080p picker,
+    fps 30/60 picker, start/end tick fields, Export + Back buttons
+[x] ExportSettings built from screen (PNG_SEQUENCE, no audio, %04d) -> EXPORT_JOB
+[x] /flashback export opens the screen (Minecraft.submit -> setScreen)
+[x] MP4-after-PNG automatic (assembleMp4InBackground from ExportJob + encode-start chat notice)
+[ ] On-screen progress state during encode
+[ ] Test: open replay on phone -> /flashback export -> PNGs + MP4 appear, chat receipt posts
+
+=== PHASE 2 — Keyframe commands ===
+[x] MobileKeyframes.java: add <camera|fov|freeze|timelapse|time> [value] at replay tick,
+    list, clear (current scene only), mirrored on TimelineWindow construction + undo-safe writes
+[x] Wired: MobileKeyframes.register(flashback) in existing command block
+[ ] Test: add 2 camera keys on phone, export, camera moves (see agent test steps in chat)
+
+=== PHASE 3 — Recording gaps ===
+[x] POV recording: per-tick CameraType poll on change via synthetic cooldown packet;
+    restore on playback (viewer) + export per-frame; old replays default first-person;
+    editor-force wins only while editor UI active
+[x] Own-inventory open/close events: poll InventoryScreen state, synthetic open/close packets,
+    reopen on playback (containers already replay via server packets)
+[x] recordHotbar=true default on Android only (PC default untouched)
+[ ] Test each on phone: F5 replay, slot switch replay, inventory open replay
+
+=== PHASE 4 — True ImGui via NDK (IN PROGRESS, gui work copy) ===
+[x] NDK r28 toolchain validated (aarch64 API26, system-only NEEDED)
+[x] v1.90.0 JNI sources relocated imgui->imgui.moulberry90 (jnigen regen)
+[x] arm64-v8a .so built (11.7MB, 3883/3883 symbols; only win32hideFromTaskBar absent — guarded by IS_WINDOWS, unreachable on Android)
+[x] x86_64 .so built (11.6MB, identical symbol set)
+[x] Runtime wiring: setupAndroidImGuiNatives() first in onInitializeClient + imgui.library.path
+[x] Jar packaging: assets/flashback/imgui-android/<abi>/*.so confirmed in built jar
+[x] GUI-test jar: Flashback-0.39.9-GUI-test-for-MC1.21.11.jar (207MB, 0 errors)
+[ ] DEVICE TEST: open replay on phone -> editor timeline appears (or send new crash log)
+Source: C:\Users\negi6\Desktop\flashback2.0\Flashback-mobile-gui\
+Stable backup untouched: Flashback-0.39.9-mobile-BACKUP-20261002.jar
+
+=== FFMPEG TRACK ===
+[x] Bundled ffmpeg extract + libx264(CRF18)->mpeg4 fallback + plugin binary fallback + PNG-only fallback
+[ ] Verify on-device: one export on Mojo + latest.log lines ("assembling MP4", exit code)
+[ ] If bundled exec fails (SELinux): fallback plan = JavaCV API encode (FFmpegFrameRecorder, no fork/exec)
+[ ] If JavaCV also fails: document plugin-APK path (Mojo FFmpegPlugin rel/app-release.apk)
+[ ] Polish later: delete-PNGs-after-MP4 setting (field exists, defaults off), CRF picker in export screen
+[ ] Audio stays silent (no OpenAL loopback on phones) unless mic-track requested (new work, parked)
+
+=== AUDIT PASS (fresh-eyes agent, all fixed + green build) ===
+[x] forcePngSequence set on FFmpeg-init fallback (was: audio-crash + phantom temp-file move)
+[x] AV_PIX_FMT_RGBA constant corrected (28 -> 26, verified vs ffmpeg jar)
+[x] PNG dir-vs-prefix detection for not-yet-existing dirs
+[x] Encoder list empty/stale-index guard in StartExportWindow
+[x] Bounded ffmpeg log drain (32KB tail, no child block)
+[x] Explicit Unsafe guards (no NPE-reliance), dead ARM branch removed
+[x] Synthetic-packet design verified collision-free (IgnoredPacketSet bypass paths checked)
+
+=== TEST MATRIX (per build) ===
+[ ] arm64 phone + Mojo + JRE21 + FAPI official: record -> save -> open replay (spectator, no crash)
+[ ] /flashback export_mobile -> PNGs -> MP4 chat receipt
+[ ] latest.log contains "assembling MP4" with exit 0
+[ ] x86_64 emulator smoke (bundled ffmpeg x86_64 path)
+[ ] No-regression note: PC desktop behavior unchanged (all mobile branches gated by isAndroid())
+
+=== DELIVERABLE ===
+Jar: C:\Users\negi6\Desktop\flashback2.0\Flashback-0.39.9-mobile-for-MC1.21.11.jar
+Source: C:\Users\negi6\Desktop\flashback2.0\Flashback-mobile\
+Upstream ref: branch 1.21.11 (0.39.9) + official jar Flashback-0.39.9-for-MC1.21.11.jar

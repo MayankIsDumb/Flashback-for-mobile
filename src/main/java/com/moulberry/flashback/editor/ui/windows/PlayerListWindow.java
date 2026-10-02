@@ -1,0 +1,233 @@
+package com.moulberry.flashback.editor.ui.windows;
+
+import com.mojang.authlib.GameProfile;
+import com.moulberry.flashback.Flashback;
+import com.moulberry.flashback.editor.ui.ImGuiHelper;
+import com.moulberry.flashback.editor.ui.WindowOpenState;
+import com.moulberry.flashback.state.EditorState;
+import com.moulberry.flashback.state.EditorStateManager;
+import imgui.moulberry90.ImGui;
+import imgui.moulberry90.ImGuiViewport;
+import imgui.moulberry90.flag.ImGuiCond;
+import imgui.moulberry90.flag.ImGuiWindowFlags;
+import imgui.moulberry90.type.ImBoolean;
+import imgui.moulberry90.type.ImString;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.multiplayer.ClientPacketListener;
+import net.minecraft.client.multiplayer.PlayerInfo;
+import net.minecraft.client.resources.language.I18n;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.level.GameType;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.Locale;
+
+public class PlayerListWindow {
+
+    private static String lastSearch = null;
+    private static long lastUpdate = 0;
+    private static boolean includeNpcs = false;
+    private static boolean hasNpcs = false;
+    private static final ImString search = ImGuiHelper.createResizableImString("");
+    private static final List<PlayerInfo> searchedPlayers = new ArrayList<>();
+
+    private static void updatePlayerList() {
+        searchedPlayers.clear();
+        hasNpcs = false;
+
+        ClientPacketListener connection = Minecraft.getInstance().getConnection();
+        if (connection == null) {
+            return;
+        }
+
+        ClientLevel level = Minecraft.getInstance().level;
+        Entity camera = Minecraft.getInstance().getCameraEntity();
+
+        record SearchEntry(double distanceSq, PlayerInfo info) {}
+        List<SearchEntry> searchEntries = new ArrayList<>();
+        List<SearchEntry> searchEntriesLowPriority = new ArrayList<>();
+
+        String searchLower = lastSearch.toLowerCase(Locale.ROOT);
+        boolean blankSearch = lastSearch.isBlank();
+
+        for (PlayerInfo playerInfo : connection.getOnlinePlayers()) {
+            GameProfile profile = playerInfo.getProfile();
+
+            if (profile.id().equals(Minecraft.getInstance().player.getUUID())) {
+                continue;
+            }
+
+            if (profile.id().version() != 4) {
+                hasNpcs = true;
+                if (!includeNpcs) {
+                    continue;
+                }
+            }
+
+            double distanceSq = Double.MAX_VALUE;
+
+            if (level != null && camera != null) {
+                Player player = level.getPlayerByUUID(profile.id());
+                if (player != null) {
+                    distanceSq = player.distanceToSqr(camera);
+                }
+            }
+
+            SearchEntry searchEntry = new SearchEntry(distanceSq, playerInfo);
+            if (blankSearch) {
+                searchEntries.add(searchEntry);
+            } else {
+                String nameLower = profile.name().toLowerCase(Locale.ROOT);
+                if (nameLower.startsWith(searchLower)) {
+                    searchEntries.add(searchEntry);
+                } else if (nameLower.contains(searchLower)) {
+                    searchEntriesLowPriority.add(searchEntry);
+                }
+            }
+        }
+
+        searchEntries.sort(Comparator.comparingDouble(SearchEntry::distanceSq));
+        searchEntriesLowPriority.sort(Comparator.comparingDouble(SearchEntry::distanceSq));
+        if (searchEntries.size() < 16) {
+            searchEntries.addAll(searchEntriesLowPriority);
+        }
+
+        int count = Math.min(16, searchEntries.size());
+        for (int i = 0; i < count; i++) {
+            searchedPlayers.add(searchEntries.get(i).info);
+        }
+    }
+
+    public static void render(ImBoolean open, boolean newlyOpened) {
+        if (newlyOpened) {
+            ImGuiViewport viewport = ImGui.getMainViewport();
+            ImGui.setNextWindowPos(viewport.getCenterX(), viewport.getCenterY(), ImGuiCond.Appearing, 0.5f, 0.5f);
+        }
+
+        ImGui.setNextWindowSizeConstraints(250, 50, 5000, 5000);
+        String title = I18n.get("flashback.player_list");
+        if (ImGui.begin(title + "###PlayerList", open, ImGuiWindowFlags.AlwaysAutoResize | ImGuiWindowFlags.NoFocusOnAppearing)) {
+            String searchStr = I18n.get("flashback.search");
+            ImGui.setNextItemWidth(ImGui.getContentRegionAvailX() - ImGuiHelper.calcTextWidth(searchStr) - 32);
+            if (ImGui.inputText(searchStr, search)) {
+                lastSearch = null;
+            }
+
+            long currentTime = System.currentTimeMillis();
+            if (lastSearch == null || currentTime > lastUpdate + 3000 || currentTime < lastUpdate) {
+                lastSearch = ImGuiHelper.getString(search);
+                lastUpdate = currentTime;
+                updatePlayerList();
+            }
+
+            if (hasNpcs || includeNpcs) {
+                if (ImGui.checkbox(I18n.get("flashback.include_npcs"), includeNpcs)) {
+                    includeNpcs = !includeNpcs;
+                    lastSearch = null;
+                }
+            }
+
+            EditorState editorState = EditorStateManager.getCurrent();
+
+            ImGui.separator();
+
+            for (int i = 0; i < searchedPlayers.size(); i++) {
+                ImGui.pushID(i);
+                PlayerInfo playerInfo = searchedPlayers.get(i);
+                GameProfile profile = playerInfo.getProfile();
+
+                ImGui.textUnformatted(profile.name());
+                ImGui.sameLine();
+                if (ImGui.smallButton(I18n.get("flashback.tp"))) {
+                    Minecraft.getInstance().getConnection().sendCommand("teleport " + profile.id());
+                    lastUpdate = currentTime;
+                }
+                if (editorState != null) {
+                    ImGui.sameLine();
+                    if (editorState.hideAllSpectators && playerInfo.getGameMode() == GameType.SPECTATOR) {
+                        ImGui.beginDisabled();
+                        ImGui.smallButton(I18n.get("flashback.show"));
+                        ImGui.endDisabled();
+                        ImGui.setItemTooltip(I18n.get("flashback.hidden_because_spectator"));
+                    } else if (editorState.hideDuringExport.contains(profile.id())) {
+                        if (ImGui.smallButton(I18n.get("flashback.show"))) {
+                            editorState.hideDuringExport.remove(profile.id());
+                            lastUpdate = currentTime;
+                        }
+                    } else if (ImGui.smallButton(I18n.get("flashback.hide"))) {
+                        editorState.hideDuringExport.add(profile.id());
+                        lastUpdate = currentTime;
+                    }
+                }
+                ImGui.sameLine();
+                if (ImGui.smallButton(I18n.get("flashback.spectate"))) {
+                    Minecraft.getInstance().getConnection().sendCommand("spectate " + profile.id());
+                    lastUpdate = currentTime;
+                }
+                ImGui.popID();
+            }
+
+            ImGui.separator();
+
+            if (editorState != null) {
+                if (ImGui.button(I18n.get("flashback.hide_all"))) {
+                    changeVisibilityOfAll(editorState, false);
+                    lastUpdate = currentTime;
+                }
+                ImGui.sameLine();
+                if (ImGui.button(I18n.get("flashback.show_all"))) {
+                    changeVisibilityOfAll(editorState, true);
+                    lastUpdate = currentTime;
+                }
+                if (ImGui.checkbox(I18n.get("flashback.hide_all_spectators"), editorState.hideAllSpectators)) {
+                    editorState.hideAllSpectators = !editorState.hideAllSpectators;
+                }
+            }
+        }
+        ImGui.end();
+    }
+
+    private static void changeVisibilityOfAll(EditorState editorState, boolean visible) {
+        ClientPacketListener connection = Minecraft.getInstance().getConnection();
+        if (connection == null) {
+            return;
+        }
+
+        String searchLower = lastSearch.toLowerCase(Locale.ROOT);
+        boolean blankSearch = lastSearch.isBlank();
+
+        for (PlayerInfo playerInfo : connection.getOnlinePlayers()) {
+            GameProfile profile = playerInfo.getProfile();
+
+            if (profile.id().equals(Minecraft.getInstance().player.getUUID())) {
+                continue;
+            }
+
+            if (profile.id().version() != 4 && !includeNpcs) {
+                continue;
+            }
+
+            if (blankSearch) {
+                if (visible) {
+                    editorState.hideDuringExport.remove(profile.id());
+                } else {
+                    editorState.hideDuringExport.add(profile.id());
+                }
+            } else {
+                String nameLower = profile.name().toLowerCase(Locale.ROOT);
+                if (nameLower.contains(searchLower)) {
+                    if (visible) {
+                        editorState.hideDuringExport.remove(profile.id());
+                    } else {
+                        editorState.hideDuringExport.add(profile.id());
+                    }
+                }
+            }
+        }
+    }
+
+}

@@ -1,0 +1,46 @@
+package com.moulberry.flashback.screen.select_replay;
+
+import net.minecraft.client.gui.Font;
+import net.minecraft.client.gui.GuiGraphics;
+import net.minecraft.client.gui.components.Button;
+import net.minecraft.client.renderer.RenderPipelines;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+
+import java.util.function.Consumer;
+
+public class SortDirectionButton extends Button {
+
+    private static final Identifier DOWN_ARROW = Identifier.parse("flashback:down_arrow.png");
+    private static final Identifier UP_ARROW = Identifier.parse("flashback:up_arrow.png");
+
+    public boolean sortDescending;
+
+    public SortDirectionButton(int x, int y, int width, int height, Component component, Consumer<Boolean> changed, boolean initialSortDescending) {
+        super(x, y, width, height, component, button -> {
+            SortDirectionButton sortButton = (SortDirectionButton) button;
+            sortButton.sortDescending = !sortButton.sortDescending;
+            changed.accept(sortButton.sortDescending);
+        }, DEFAULT_NARRATION);
+        this.sortDescending = initialSortDescending;
+    }
+
+    @Override
+    protected void renderContents(GuiGraphics guiGraphics, int i, int j, float f) {
+        super.renderDefaultSprite(guiGraphics);
+
+        final int size = 16;
+        int paddingX = (this.getWidth() - size) / 2;
+        int paddingY = (this.getHeight() - size) / 2;
+
+        int x = this.getX() + paddingX;
+        int y = this.getY() + paddingY;
+
+        if (this.sortDescending) {
+            guiGraphics.blit(RenderPipelines.GUI_TEXTURED, DOWN_ARROW, x, y, 0f, 0f, size, size, size, size);
+        } else {
+            guiGraphics.blit(RenderPipelines.GUI_TEXTURED, UP_ARROW, x, y, 0f, 0f, size, size, size, size);
+        }
+    }
+
+}

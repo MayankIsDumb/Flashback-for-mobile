@@ -1,0 +1,961 @@
+package com.moulberry.flashback.exporting;
+
+import com.mojang.blaze3d.ProjectionType;
+import com.mojang.blaze3d.pipeline.RenderTarget;
+import com.mojang.blaze3d.platform.NativeImage;
+import com.mojang.blaze3d.platform.Window;
+import com.mojang.blaze3d.systems.RenderSystem;
+import com.mojang.blaze3d.vertex.BufferBuilder;
+import com.mojang.blaze3d.vertex.ByteBufferBuilder;
+import com.mojang.blaze3d.vertex.MeshData;
+import com.moulberry.flashback.*;
+import com.moulberry.flashback.combo_options.VideoContainer;
+import com.moulberry.flashback.editor.ui.ReplayUI;
+import com.moulberry.flashback.editor.ui.windows.ExportDoneWindow;
+import com.moulberry.flashback.exporting.taskbar.TaskbarManager;
+import com.moulberry.flashback.keyframe.change.KeyframeChangeTickrate;
+import com.moulberry.flashback.keyframe.handler.KeyframeHandler;
+import com.moulberry.flashback.keyframe.handler.MinecraftKeyframeHandler;
+import com.moulberry.flashback.keyframe.handler.TickrateKeyframeCapture;
+import com.moulberry.flashback.sound.FlashbackAudioManager;
+import com.moulberry.flashback.state.EditorState;
+import com.moulberry.flashback.playback.ReplayServer;
+import com.moulberry.flashback.visuals.AccurateEntityPositionHandler;
+import net.minecraft.ChatFormatting;
+import net.minecraft.util.Util;
+import net.minecraft.client.Camera;
+import net.minecraft.client.DeltaTracker;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.Font;
+import net.minecraft.client.multiplayer.ClientLevel;
+import net.minecraft.client.player.LocalPlayer;
+import net.minecraft.client.renderer.CachedOrthoProjectionMatrixBuffer;
+import net.minecraft.client.resources.sounds.SimpleSoundInstance;
+import net.minecraft.network.chat.Component;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.world.entity.Entity;
+import net.minecraft.world.entity.LivingEntity;
+import net.minecraft.world.phys.Vec3;
+import org.bytedeco.ffmpeg.global.avutil;
+import org.joml.Matrix4f;
+import org.lwjgl.glfw.GLFW;
+import org.lwjgl.openal.SOFTLoopback;
+
+import java.io.IOException;
+import java.math.BigDecimal;
+import java.math.MathContext;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.FloatBuffer;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.locks.LockSupport;
+
+public class ExportJob {
+
+    private final ExportSettings settings;
+
+    private boolean running = false;
+    private boolean shouldChangeFramebufferSize = false;
+    private long lastRenderMillis;
+    private long escapeCancelStartMillis = -1;
+    private long renderStartTime;
+
+    private final Random particleRandom;
+    private long currentClientTickSeed = 0L;
+    private long currentInitialEntityTickSeed = 0L;
+
+    private boolean showingDebug = false;
+    private boolean pressedDebugKey = false;
+    private long serverTickTimeNanos = 0;
+    private long clientTickTimeNanos = 0;
+    private long renderTimeNanos = 0;
+    private long encodeTimeNanos = 0;
+    private long downloadTimeNanos = 0;
+    private boolean patreonLinkClicked = false;
+
+    private int extraDummyFrames = 0;
+
+    private boolean displayPresentFailed = false;
+
+    // Route-2 POV restore state: last camera ordinal applied to client options (-1 = unknown).
+    private int lastAppliedCameraType = -1;
+
+    private boolean forcePngSequence = false;
+
+    private boolean shouldRecordAudio() {
+        if (this.forcePngSequence) {
+            return false;
+        }
+        return this.settings.recordAudio();
+    }
+
+    private FloatBuffer captureAudioSamples() {
+        if (this.forcePngSequence || !shouldRecordAudio()) {
+            return null;
+        }
+        try {
+            long device = Minecraft.getInstance().getSoundManager().soundEngine.library.currentDevice;
+
+            this.audioSamples += 48000 / this.settings.framerate();
+            int renderSamples = (int) this.audioSamples;
+            this.audioSamples -= renderSamples;
+
+            int channels = this.settings.stereoAudio() ? 2 : 1;
+
+            FloatBuffer audioBuffer = ByteBuffer.allocateDirect(renderSamples * 4 * channels).order(ByteOrder.nativeOrder()).asFloatBuffer();
+            SOFTLoopback.alcRenderSamplesSOFT(device, audioBuffer, renderSamples);
+            return audioBuffer;
+        } catch (LinkageError | RuntimeException e) {
+            Flashback.LOGGER.warn("OpenAL loopback unavailable, disabling audio capture for this export", e);
+            this.audioSamples = 0.0;
+            return null;
+        }
+    }
+
+    public int progressCount = 0;
+    public int progressOutOf = 0;
+
+    private double currentTickDouble = 0.0;
+
+    private double audioSamples = 0.0;
+
+    private final AtomicBoolean finishedServerTick = new AtomicBoolean(false);
+
+    private NativeImage firstFrame = null;
+    private int writtenFrames = 0;
+
+    public static final int SRC_PIXEL_FORMAT = avutil.AV_PIX_FMT_RGBA;
+
+    public ExportJob(ExportSettings settings) {
+        this.settings = settings;
+        this.particleRandom = this.settings.resetRng() ? new Random(2000) : null;
+    }
+
+    public boolean isRunning() {
+        return this.running;
+    }
+
+    public void onFinishedServerTick() {
+        this.finishedServerTick.set(true);
+    }
+
+    public boolean shouldChangeFramebufferSize() {
+        return this.running && this.shouldChangeFramebufferSize;
+    }
+
+    public int getWidth() {
+        return this.settings.resolutionX() * (this.settings.ssaa() ? 2 : 1);
+    }
+
+    public int getHeight() {
+        return this.settings.resolutionY() * (this.settings.ssaa() ? 2 : 1);
+    }
+
+    public double getCurrentTickDouble() {
+        return this.currentTickDouble;
+    }
+
+    public Random getParticleRandom() {
+        return this.particleRandom;
+    }
+
+    public long getSeedForCurrentClientTick() {
+        return this.currentClientTickSeed;
+    }
+
+    public long getInitialEntitySeedForCurrentClientTick() {
+        this.currentInitialEntityTickSeed += 1;
+        return this.currentInitialEntityTickSeed;
+    }
+
+    public ExportSettings getSettings() {
+        return this.settings;
+    }
+
+    public void run() {
+        ReplayServer replayServer = Flashback.getReplayServer();
+        if (this.running || replayServer == null) {
+            throw new IllegalStateException("run() called twice");
+        }
+        this.running = true;
+        Minecraft.getInstance().mouseHandler.releaseMouse();
+        Minecraft.getInstance().getSoundManager().stop();
+        Minecraft.getInstance().getSoundManager().tick(true);
+
+        TaskbarManager.launchTaskbarManager();
+
+        UUID uuid = UUID.randomUUID();
+
+        this.forcePngSequence = this.settings.container() != VideoContainer.PNG_SEQUENCE &&
+            !MobileCompat.isFFmpegNativeSupported();
+        if (this.forcePngSequence) {
+            Flashback.LOGGER.warn("FFmpeg unavailable on Android, forcing PNG sequence export");
+        }
+
+        String tempFileName = MobileCompat.exportTempDir().resolve(uuid + "." + this.settings.container().extension()).toString();
+        Path exportTempFile = Path.of(tempFileName);
+        Path exportTempFolder = exportTempFile.getParent();
+        boolean keepTempFile = false;
+
+        int oldGuiScale = Minecraft.getInstance().options.guiScale().get();
+
+        this.extraDummyFrames = Flashback.getConfig().exporting.exportRenderDummyFrames;
+
+        try {
+            Files.createDirectories(exportTempFolder);
+
+            try (VideoWriter encoder = createVideoWriter(this.settings, tempFileName);
+                 SaveableFramebufferQueue downloader = new SaveableFramebufferQueue(this.settings.resolutionX(), this.settings.resolutionY())) {
+                doExport(encoder, downloader);
+            }
+
+            Path outputLocation = this.settings.output();
+            boolean errorMovingToOutput = false;
+            if (this.settings.container() != VideoContainer.PNG_SEQUENCE && !this.forcePngSequence) {
+                try {
+                    Files.move(exportTempFile, this.settings.output(), StandardCopyOption.REPLACE_EXISTING);
+                } catch (IOException e) {
+                    Flashback.LOGGER.error("Error while moving temp file to export output", e);
+                    outputLocation = exportTempFile;
+                    errorMovingToOutput = true;
+                    keepTempFile = true;
+                }
+            }
+
+            try {
+                long size = 0;
+                double duration = this.writtenFrames / this.settings.framerate();
+
+                if (!this.forcePngSequence && this.settings.container() != VideoContainer.PNG_SEQUENCE && Files.exists(outputLocation) && Files.isRegularFile(outputLocation)) {
+                    size = Files.size(outputLocation);
+                }
+
+                ExportDoneWindow.addFinishedExportEntry(new ExportDoneWindow.FinishedExportEntry(this.settings, outputLocation, errorMovingToOutput, this.firstFrame, duration, size));
+                this.firstFrame = null;
+                if (MobileCompat.isAndroid()
+                    && (this.forcePngSequence || this.settings.container() == VideoContainer.PNG_SEQUENCE)) {
+                    MobileCompat.assembleMp4InBackground(this.settings);
+                }
+            } catch (IOException ignored) {}
+        } catch (IOException e) {
+            throw new RuntimeException(e);
+        } finally {
+            this.running = false;
+            this.shouldChangeFramebufferSize = false;
+
+            // Reset display size
+            Minecraft.getInstance().options.guiScale().set(oldGuiScale);
+            Minecraft.getInstance().resizeDisplay();
+
+            // Refreeze server & client
+            replayServer.replayPaused = true;
+            ClientLevel level = Minecraft.getInstance().level;
+            if (level != null) {
+                level.tickRateManager().setFrozen(true);
+            }
+
+            Minecraft.getInstance().getSoundManager().stop();
+            Minecraft.getInstance().getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.NOTE_BLOCK_CHIME, 1.0f));
+            Minecraft.getInstance().getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.NOTE_BLOCK_BELL, 1.0f));
+
+            if (this.firstFrame != null) {
+                this.firstFrame.close();
+                this.firstFrame = null;
+            }
+
+            if (!keepTempFile) {
+                try {
+                    Files.deleteIfExists(exportTempFile);
+                } catch (IOException ignored) {}
+            }
+
+            try {
+                Files.deleteIfExists(exportTempFolder);
+            } catch (IOException ignored) {}
+        }
+    }
+
+    private VideoWriter createVideoWriter(ExportSettings settings, String tempFileName) {
+        if (settings.container() == VideoContainer.PNG_SEQUENCE) {
+            return new PNGSequenceVideoWriter(settings);
+        } else if (!MobileCompat.isFFmpegNativeSupported()) {
+            Flashback.LOGGER.warn("FFmpeg natives unavailable on Android (Pojav/Mojo/Zenith), falling back to PNG sequence to {}", settings.output());
+            this.forcePngSequence = true;
+            return new PNGSequenceVideoWriter(settings);
+        } else {
+            try {
+                return new AsyncFFmpegVideoWriter(settings, tempFileName);
+            } catch (RuntimeException | Error e) {
+                // LinkageError (missing natives), ExceptionInInitializerError, or a
+                // runtime failure: mark forcePngSequence so audio capture is skipped
+                // (PNG writer rejects audio buffers) and the temp-file move step below
+                // is skipped (the PNG writer targets settings.output() directly).
+                Flashback.LOGGER.error("FFmpeg init failed, falling back to PNG sequence", e);
+                this.forcePngSequence = true;
+                return new PNGSequenceVideoWriter(settings);
+            }
+        }
+    }
+
+    private void doExport(VideoWriter videoWriter, SaveableFramebufferQueue downloader) {
+        ReplayServer replayServer = Flashback.getReplayServer();
+        if (replayServer == null) {
+            return;
+        }
+
+        Random random = new Random(1000);
+        Random mathRandom = this.settings.resetRng() ? Utils.getInternalMathRandom() : null;
+
+        this.setup(replayServer);
+        this.updateRandoms(random, mathRandom);
+
+        shouldChangeFramebufferSize = true;
+        // Double gui scale if using SSAA which doubles resolution
+        if (this.settings.ssaa()) {
+            Minecraft.getInstance().options.guiScale().set(Minecraft.getInstance().options.guiScale().get() * 2);
+        }
+        Minecraft.getInstance().resizeDisplay();
+
+        List<TickInfo> ticks = calculateTicks(this.settings.editorState(), this.settings.startTick(), this.settings.endTick(), this.settings.framerate());
+
+        int clientTickCount = 0;
+
+        this.renderStartTime = System.currentTimeMillis();
+
+        double lastClientTickDouble = 0;
+
+        for (int tickIndex = 0; tickIndex < ticks.size(); tickIndex++) {
+            TickInfo tickInfo = ticks.get(tickIndex);
+            boolean frozen = tickInfo.frozen;
+            this.currentTickDouble = tickInfo.serverTick;
+            int targetServerTick = this.settings.startTick() + (int) currentTickDouble;
+
+            float deltaTicksFloat = (float)(tickInfo.clientTick - lastClientTickDouble);
+            lastClientTickDouble = tickInfo.clientTick;
+            double partialClientTick = tickInfo.clientTick - (int) tickInfo.clientTick;
+
+            // Wait until server is on correct replay tick
+            long start = System.nanoTime();
+            this.setServerTickAndWait(replayServer, targetServerTick, false);
+            serverTickTimeNanos += System.nanoTime() - start;
+
+            // Tick client
+            while (clientTickCount < (int) tickInfo.clientTick) {
+                start = System.nanoTime();
+                this.updateRandoms(random, mathRandom);
+                this.runClientTick(frozen);
+                clientTickTimeNanos += System.nanoTime() - start;
+
+                clientTickCount += 1;
+            }
+
+            this.updateClientFreeze(frozen);
+
+            DeltaTracker.Timer timer = Minecraft.getInstance().deltaTracker;
+            timer.updateFrozenState(frozen);
+            timer.updatePauseState(false);
+            timer.deltaTicks = deltaTicksFloat;
+            timer.realtimeDeltaTicks = deltaTicksFloat;
+            timer.deltaTickResidual = (float) partialClientTick;
+            timer.pausedDeltaTickResidual = (float) partialClientTick;
+
+            AccurateEntityPositionHandler.apply(Minecraft.getInstance().level, timer);
+
+            // Apply keyframes
+            if (frozen) {
+                FlashbackAudioManager.pauseAll();
+            } else {
+                FlashbackAudioManager.startHandling();
+            }
+            try {
+                KeyframeHandler keyframeHandler = new MinecraftKeyframeHandler(Minecraft.getInstance());
+                this.settings.editorState().applyKeyframes(keyframeHandler, (float)(this.settings.startTick() + currentTickDouble));
+            } finally {
+                if (!frozen) {
+                    FlashbackAudioManager.finishHandling();
+                }
+            }
+
+            // Route-2 POV restore per frame: the replay timeline owns localPlayerCameraType
+            // (updated as the server advances through the synthetic cooldown packets).
+            // Who wins: MixinMinecraft.tick forces first-person only while the editor UI is active;
+            // exports run with the UI inactive, so the force is dormant and this restore sticks.
+            int recordedCameraType = replayServer.getGamePacketHandler().localPlayerCameraType;
+            if (recordedCameraType != this.lastAppliedCameraType) {
+                this.lastAppliedCameraType = recordedCameraType;
+                net.minecraft.client.CameraType[] cameraTypes = net.minecraft.client.CameraType.values();
+                net.minecraft.client.CameraType cameraType =
+                    cameraTypes[Math.max(0, Math.min(recordedCameraType, cameraTypes.length - 1))];
+                Minecraft.getInstance().options.setCameraType(cameraType);
+                Minecraft.getInstance().levelRenderer.needsUpdate();
+            }
+
+            long pauseScreenStart = System.currentTimeMillis();
+            int additionalDummyFrames = this.extraDummyFrames;
+            if (tickIndex == 0) {
+                additionalDummyFrames = Math.max(this.extraDummyFrames, 60);
+            }
+            while (Minecraft.getInstance().getOverlay() != null || Minecraft.getInstance().screen != null || additionalDummyFrames > 0) {
+                boolean overlayOrScreen = Minecraft.getInstance().getOverlay() != null || Minecraft.getInstance().screen != null;
+                if (overlayOrScreen) {
+                    this.runClientTick(frozen);
+                }
+                if (additionalDummyFrames > 0) {
+                    additionalDummyFrames -= 1;
+                }
+
+                Window window = Minecraft.getInstance().getWindow();
+                RenderTarget renderTarget = Minecraft.getInstance().mainRenderTarget;
+                RenderSystem.getDevice().createCommandEncoder().clearColorAndDepthTextures(renderTarget.getColorTexture(), 0, renderTarget.getDepthTexture(), 1.0);
+                Minecraft.getInstance().gameRenderer.render(Minecraft.getInstance().deltaTracker, true);
+
+                if (overlayOrScreen) {
+                    finishFrame(renderTarget, new ArrayList<>(List.of("Waiting for overlay to disappear")), true, false);
+                } else if (tickIndex == 0) {
+                    finishFrame(renderTarget, new ArrayList<>(List.of("Warming up... " + Math.max(0, 60 - additionalDummyFrames) + "/60")), true, false);
+                }
+
+                if (overlayOrScreen) {
+                    LockSupport.parkNanos("waiting for pause overlay to disappear", 50_000_000L);
+
+                    // Force remove screens/overlays after 5s/15s respectively
+                    long currentTime = System.currentTimeMillis();
+                    if (pauseScreenStart > currentTime) {
+                        pauseScreenStart = currentTime;
+                    }
+                    if (currentTime - pauseScreenStart > 5000) {
+                        Minecraft.getInstance().setScreen(null);
+                    }
+                    if (currentTime - pauseScreenStart > 15000) {
+                        Minecraft.getInstance().setOverlay(null);
+                    }
+                }
+
+                this.updateClientFreeze(frozen);
+
+                timer.updateFrozenState(frozen);
+                timer.updatePauseState(false);
+                timer.deltaTicks = deltaTicksFloat;
+                timer.realtimeDeltaTicks = deltaTicksFloat;
+                timer.deltaTickResidual = (float) partialClientTick;
+                timer.pausedDeltaTickResidual = (float) partialClientTick;
+            }
+
+            SaveableFramebuffer saveable = downloader.take();
+            RenderTarget renderTarget = Minecraft.getInstance().mainRenderTarget;
+
+            // Perform rendering
+            PerfectFrames.waitUntilFrameReady();
+            RenderSystem.getDevice().createCommandEncoder().clearColorAndDepthTextures(renderTarget.getColorTexture(), 0, renderTarget.getDepthTexture(), 1.0);
+
+            start = System.nanoTime();
+            Minecraft.getInstance().gameRenderer.render(timer, true);
+            renderTimeNanos += System.nanoTime() - start;
+
+            // Capture audio if necessary (null when forcing PNG sequence or loopback is unavailable)
+            FloatBuffer audioBuffer = this.captureAudioSamples();
+
+            saveable.audioBuffer = audioBuffer;
+            downloader.startDownload(renderTarget, saveable, this.settings.ssaa());
+            submitDownloadedFrames(videoWriter, downloader, false);
+
+            this.shouldChangeFramebufferSize = false;
+            boolean cancel = finishFrameNormal(renderTarget, tickIndex, ticks.size());
+            this.shouldChangeFramebufferSize = true;
+
+            if (cancel) {
+                ExportJobQueue.drainingQueue = false;
+                break;
+            }
+        }
+
+        submitDownloadedFrames(videoWriter, downloader, true);
+
+        long finishStart = System.currentTimeMillis();
+        videoWriter.finish(info -> {
+            long time = System.currentTimeMillis() - finishStart;
+            String progress = "Finalizing video (" + info + ")... " + time/1000 + "s";
+            finishFrameFinal(Minecraft.getInstance().mainRenderTarget, progress, false);
+        });
+    }
+
+    private void updateRandoms(Random random, Random mathRandom) {
+        if (!this.settings.resetRng()) {
+            return;
+        }
+
+        Minecraft minecraft = Minecraft.getInstance();
+
+        long connectionSeed = random.nextLong();
+        long levelSeed = random.nextLong();
+        long entitySeed = random.nextLong();
+        long mathSeed = random.nextLong();
+        long particleSeed = random.nextLong();
+        this.currentClientTickSeed = random.nextLong();
+        this.currentInitialEntityTickSeed = random.nextLong();
+
+        if (minecraft.getConnection() != null) {
+            minecraft.getConnection().random.setSeed(connectionSeed);
+        }
+        if (minecraft.level != null) {
+            minecraft.level.random.setSeed(levelSeed);
+
+            for (Entity entity : minecraft.level.entitiesForRendering()) {
+                if (entity == null) {
+                    continue;
+                }
+
+                entity.getRandom().setSeed(entitySeed ^ entity.getUUID().getMostSignificantBits());
+            }
+        }
+        if (mathRandom != null) {
+            mathRandom.setSeed(mathSeed);
+        }
+        this.particleRandom.setSeed(particleSeed);
+    }
+
+    private void setup(ReplayServer replayServer) {
+        Minecraft minecraft = Minecraft.getInstance();
+
+        replayServer.setDesiredTickRate(20.0f, true);
+
+        if (replayServer.getReplayTick() != this.settings.startTick()) {
+            int currentTick = Math.max(0, this.settings.startTick() - 40);
+
+            // Ensure replay server is paused at currentTick
+            this.setServerTickAndWait(replayServer, currentTick, true);
+            this.runClientTick(false);
+
+            // Clear particles
+            minecraft.particleEngine.clearParticles();
+
+            // Reset all walk animations & tick counts
+            if (minecraft.level != null) {
+                for (Entity entity : minecraft.level.entitiesForRendering()) {
+                    if (entity instanceof LivingEntity livingEntity) {
+                        livingEntity.walkAnimation.stop();
+                    }
+                    entity.tickCount = 0;
+                }
+            }
+
+            // Advance until tick is at start
+            while (currentTick < this.settings.startTick()) {
+                currentTick += 1;
+                this.setServerTickAndWait(replayServer, currentTick, true);
+                this.runClientTick(false);
+            }
+
+            // Apply initial position and keyframes at start tick
+            LocalPlayer player = minecraft.player;
+            if (player != null) {
+                Vec3 position = this.settings.initialCameraPosition();
+                player.snapTo(position.x, position.y, position.z, this.settings.initialCameraYaw(), this.settings.initialCameraPitch());
+                player.getInterpolation().cancel();
+                player.setDeltaMovement(Vec3.ZERO);
+            }
+            this.settings.editorState().applyKeyframes(new MinecraftKeyframeHandler(Minecraft.getInstance()), this.settings.startTick());
+            this.runClientTick(false);
+
+            // Ensured replay server is paused at startTick
+            this.setServerTickAndWait(replayServer, this.settings.startTick(), true);
+            this.runClientTick(false);
+        }
+
+        // Remove screen
+        minecraft.setScreen(null);
+    }
+
+    private void setServerTickAndWait(ReplayServer replayServer, int targetTick, boolean force) {
+        if (force || replayServer.getReplayTick() != targetTick) {
+            this.finishedServerTick.set(false);
+
+            replayServer.goToReplayTick(targetTick);
+            replayServer.replayPaused = true;
+            replayServer.sendFinishedServerTick.set(true);
+
+            while (!this.finishedServerTick.compareAndExchange(true, false)) {
+                LockSupport.parkNanos("waiting for server thread", 100000L);
+            }
+        }
+    }
+
+    private void runClientTick(boolean frozen) {
+        this.updateClientFreeze(frozen);
+
+        Minecraft minecraft = Minecraft.getInstance();
+
+        minecraft.packetProcessor().processQueuedPackets();
+        while (minecraft.pollTask()) {}
+        this.updateClientFreeze(frozen);
+        if (!frozen) {
+            minecraft.getTextureManager().tick();
+        }
+        minecraft.tick();
+        this.updateSoundSource(minecraft);
+
+        this.updateClientFreeze(frozen);
+    }
+
+    private void updateSoundSource(Minecraft minecraft) {
+        EditorState editorState = this.settings.editorState();
+        if (editorState != null) {
+            Camera audioCamera = editorState.getAudioCamera();
+            if (audioCamera != null) {
+                minecraft.getSoundManager().updateSource(audioCamera);
+                return;
+            }
+        }
+
+        minecraft.getSoundManager().updateSource(Minecraft.getInstance().gameRenderer.getMainCamera());
+    }
+
+    private void updateClientFreeze(boolean frozen) {
+        ClientLevel level = Minecraft.getInstance().level;
+        if (level != null) {
+            level.tickRateManager().setFrozen(frozen);
+        }
+    }
+
+    private void submitDownloadedFrames(VideoWriter videoWriter, SaveableFramebufferQueue downloader, boolean drain) {
+        SaveableFramebufferQueue.DownloadedFrame frame;
+        while (true) {
+            long start = System.nanoTime();
+            frame = downloader.finishDownload(drain);
+            downloadTimeNanos += System.nanoTime() - start;
+
+            if (frame == null) {
+                break;
+            }
+
+            if (this.firstFrame == null) {
+                this.firstFrame = frame.image().mappedCopy(x -> 0xFF000000 | x);
+            }
+            this.writtenFrames += 1;
+
+            start = System.nanoTime();
+            videoWriter.encode(frame.image(), frame.audioBuffer());
+            encodeTimeNanos += System.nanoTime() - start;
+        }
+    }
+
+    private static CachedOrthoProjectionMatrixBuffer projectionBuffers = null;
+
+    private static RenderTarget displayTarget = null;
+
+    private boolean finishFrameNormal(RenderTarget framebuffer, int currentFrame, int totalFrames) {
+        this.progressCount = currentFrame;
+        this.progressOutOf = totalFrames;
+
+        if (currentFrame == totalFrames) {
+            this.finishFrameFinal(framebuffer, "Saving...", true);
+            return false;
+        }
+
+        List<String> lines = new ArrayList<>();
+
+        lines.add("Exported Frames: " + currentFrame + "/" + totalFrames);
+
+        long currentTime = System.currentTimeMillis();
+        long elapsed = currentTime - this.renderStartTime;
+        lines.add("Time elapsed: " + formatTime(elapsed));
+
+        if (currentFrame >= this.settings.framerate()) {
+            long estimatedRemaining = (currentTime - this.renderStartTime) * (totalFrames - currentFrame) / currentFrame;
+            lines.add("Estimated time remaining: " + formatTime(estimatedRemaining));
+        } else {
+            lines.add("Estimated time remaining: ~");
+        }
+
+        return this.finishFrame(framebuffer, lines, false, true);
+    }
+
+    private void finishFrameFinal(RenderTarget framebuffer, String customProgress, boolean forceShow) {
+        List<String> lines = new ArrayList<>();
+        lines.add(customProgress);
+        this.finishFrame(framebuffer, lines, forceShow, false);
+    }
+
+    private boolean finishFrame(RenderTarget framebuffer, List<String> lines, boolean forceShow, boolean showCancel) {
+        RenderSystem.executePendingTasks();
+
+        long currentTime = System.currentTimeMillis();
+        if (currentTime - this.lastRenderMillis > 1000/60 || forceShow) {
+            this.lastRenderMillis = currentTime;
+        } else {
+            return false;
+        }
+
+        boolean cancel = false;
+
+        Window window = Minecraft.getInstance().getWindow();
+
+        Font font = Minecraft.getInstance().font;
+
+        int windowFramebufferWidth = WindowSizeTracker.getWidth(window);
+        int windowFramebufferHeight = WindowSizeTracker.getHeight(window);
+
+        displayTarget = FramebufferUtils.resizeOrCreateFramebuffer(displayTarget, windowFramebufferWidth, windowFramebufferHeight, true);
+        FramebufferUtils.clear(displayTarget, 0xFF000000);
+        var previousColorOutputOverride = RenderSystem.outputColorTextureOverride;
+        var previousDepthOutputOverride = RenderSystem.outputDepthTextureOverride;
+        RenderSystem.outputColorTextureOverride = displayTarget.getColorTextureView();
+        RenderSystem.outputDepthTextureOverride = displayTarget.getDepthTextureView();
+
+        // Copy framebuffer to display
+        float aspectWidth = framebuffer.width / (float) windowFramebufferWidth;
+        float aspectHeight = framebuffer.height / (float) windowFramebufferHeight;
+        float framebufferX1, framebufferY1, framebufferX2, framebufferY2;
+        if (aspectWidth > aspectHeight) {
+            framebufferX1 = 0;
+            framebufferX2 = 1;
+            framebufferY1 = 0.5f - aspectHeight/aspectWidth/2;
+            framebufferY2 = 0.5f + aspectHeight/aspectWidth/2;
+        } else {
+            framebufferY1 = 0;
+            framebufferY2 = 1;
+            framebufferX1 = 0.5f - aspectWidth/aspectHeight/2;
+            framebufferX2 = 0.5f + aspectWidth/aspectHeight/2;
+        }
+        FramebufferUtils.blitTo(framebuffer.getColorTextureView(), displayTarget, windowFramebufferWidth, windowFramebufferHeight, framebufferX1, framebufferY1, framebufferX2, framebufferY2);
+
+        float guiScale = Math.min(windowFramebufferWidth / 420, windowFramebufferHeight / 240);
+        int scaledWidth = (int) Math.ceil(windowFramebufferWidth / guiScale);
+        int scaledHeight = (int) Math.ceil(windowFramebufferHeight / guiScale);
+
+        if (projectionBuffers == null) {
+            projectionBuffers = new CachedOrthoProjectionMatrixBuffer("flashback export", -1.0f, 1.0f, true);
+        }
+
+        var buffer = projectionBuffers.getBuffer(scaledWidth, scaledHeight);
+        RenderSystem.setProjectionMatrix(buffer, ProjectionType.ORTHOGRAPHIC);
+
+        Matrix4f poseMatrix = new Matrix4f();
+
+        if (this.settings.name() != null) {
+            lines.add(0, this.settings.name());
+            lines.add(1, "");
+        }
+
+        lines.add("");
+
+        boolean debugPressed = GLFW.glfwGetKey(Minecraft.getInstance().getWindow().handle(), GLFW.GLFW_KEY_F3) != GLFW.GLFW_RELEASE;
+        if (pressedDebugKey != debugPressed) {
+            pressedDebugKey = debugPressed;
+            if (pressedDebugKey) {
+                showingDebug = !showingDebug;
+            }
+        }
+
+        if (showingDebug) {
+            lines.add("ST: " + serverTickTimeNanos/1000000 + ", CT: " + clientTickTimeNanos/1000000);
+            lines.add("RT: " + renderTimeNanos/1000000 + ", ET: " + encodeTimeNanos/1000000);
+        } else {
+            lines.add("Press [F3] to show debug info");
+        }
+
+        lines.add("");
+
+        if (showCancel) {
+            if (GLFW.glfwGetKey(Minecraft.getInstance().getWindow().handle(), GLFW.GLFW_KEY_ESCAPE) != GLFW.GLFW_RELEASE) {
+                long current = System.currentTimeMillis();
+                if (this.escapeCancelStartMillis <= 0 || current < this.escapeCancelStartMillis) {
+                    this.escapeCancelStartMillis = current;
+                }
+                if (current - this.escapeCancelStartMillis > 3000) {
+                    cancel = true;
+                    lines.add("Saving...");
+                } else {
+                    long remainingSeconds = 3 - (current - this.escapeCancelStartMillis) / 1000;
+                    lines.add("Hold [ESC] to cancel (" + remainingSeconds + "s)");
+                }
+            } else {
+                lines.add("Hold [ESC] to cancel");
+                this.escapeCancelStartMillis = -1;
+            }
+        }
+
+        var bufferSource = Minecraft.getInstance().renderBuffers().bufferSource();
+        int x = scaledWidth / 2;
+        int y = scaledHeight / 2 - font.lineHeight * (lines.size() + 1)/2;
+        for (String line : lines) {
+            if (line.isEmpty()) {
+                y += font.lineHeight / 2 + 1;
+            } else {
+                font.drawInBatch(line, x - font.width(line)/2f, y,
+                    -1, true, poseMatrix, bufferSource, Font.DisplayMode.NORMAL, 0, 0xF000F0);
+                y += font.lineHeight;
+            }
+        }
+
+        double mouseX = ReplayUI.imguiGlfw.rawMouseX / window.getScreenWidth() * scaledWidth;
+        double mouseY = ReplayUI.imguiGlfw.rawMouseY / window.getScreenHeight() * scaledHeight;
+
+        y += font.lineHeight / 2 + 1;
+
+        String patreon = "https://www.patreon.com/flashbackmod";
+        int patreonWidth = font.width(patreon);
+        if (mouseX > x - patreonWidth/2f && mouseX < x + patreonWidth/2f && mouseY > y && mouseY < y + font.lineHeight) {
+            var underlined = Component.literal(patreon).withStyle(ChatFormatting.UNDERLINE);
+            font.drawInBatch(underlined, x - patreonWidth / 2f, y,
+                -1, true, poseMatrix, bufferSource, Font.DisplayMode.NORMAL, 0, 0xF000F0);
+
+            if (GLFW.glfwGetMouseButton(window.handle(), GLFW.GLFW_MOUSE_BUTTON_LEFT) != 0) {
+                if (!this.patreonLinkClicked) {
+                    this.patreonLinkClicked = true;
+                    Util.getPlatform().openUri(patreon);
+                }
+            } else {
+                this.patreonLinkClicked = false;
+            }
+        } else {
+            font.drawInBatch(patreon, x - patreonWidth/2f, y,
+                -1, true, poseMatrix, bufferSource, Font.DisplayMode.NORMAL, 0, 0xF000F0);
+            this.patreonLinkClicked = false;
+        }
+
+        bufferSource.endBatch();
+
+        RenderSystem.outputColorTextureOverride = previousColorOutputOverride;
+        RenderSystem.outputDepthTextureOverride = previousDepthOutputOverride;
+
+        if (!window.isMinimized()) {
+            try {
+                displayTarget.blitToScreen();
+            } catch (Throwable t) {
+                if (MobileCompat.isAndroid()) {
+                    if (!this.displayPresentFailed) {
+                        this.displayPresentFailed = true;
+                        Flashback.LOGGER.warn("Flashback mobile: display present failed (Vulkan/custom backend), continuing export without on-screen preview", t);
+                    }
+                } else {
+                    throw SneakyThrow.sneakyThrow(t);
+                }
+            }
+        }
+        try {
+            window.updateDisplay(null);
+        } catch (Throwable t) {
+            if (!MobileCompat.isAndroid()) {
+                throw SneakyThrow.sneakyThrow(t);
+            }
+        }
+
+        RenderSystem.getDynamicUniforms().reset();
+
+        return cancel;
+    }
+
+    private String formatTime(long millis) {
+        long seconds = (millis / 1000) % 60;
+        long minutes = (millis / 1000 / 60) % 60;
+        long hours = millis / 1000 / 60 / 60;
+
+        if (hours > 0) {
+            return hours + "h " + minutes + "m " + seconds + "s";
+        } else if (minutes > 0) {
+            return minutes + "m " + seconds + "s";
+        } else {
+            return seconds + "s";
+        }
+    }
+
+    private record TickInfo(double serverTick, double clientTick, boolean frozen) {}
+
+    private static List<TickInfo> calculateTicks(EditorState editorState, int startTick, int endTick, double fps) {
+        List<TickInfo> ticks = new ArrayList<>();
+
+        ticks.add(new TickInfo(0, 0, false));
+
+        BigDecimal lastResidual = BigDecimal.ZERO;
+        BigDecimal residual = BigDecimal.ZERO;
+        BigDecimal fpsReciprocal = BigDecimal.ONE.divide(BigDecimal.valueOf(fps), MathContext.DECIMAL128);
+        int currentTick = 0;
+
+        TickrateKeyframeCapture capture = new TickrateKeyframeCapture();
+
+        int count = endTick - startTick;
+        int startFrozen = -1;
+        while (currentTick <= count) {
+            BigDecimal remainingFrame = BigDecimal.ONE;
+
+            while (remainingFrame.compareTo(BigDecimal.ZERO) > 0) {
+                capture.tickrate = 20.0f;
+                capture.frozen = false;
+                editorState.applyKeyframes(capture, startTick + currentTick + residual.floatValue());
+
+                capture.tickrate = Math.max(KeyframeChangeTickrate.MIN_TICKRATE, capture.tickrate);
+
+                BigDecimal ticksThisFrame = BigDecimal.valueOf(capture.tickrate).multiply(fpsReciprocal).multiply(remainingFrame);
+                if (ticksThisFrame.compareTo(BigDecimal.ONE) > 0) {
+                    residual = residual.add(BigDecimal.ONE);
+                    // remainingFrame *= 1 - 1/ticksThisFrame
+                    BigDecimal lastRemainingFrame = remainingFrame;
+                    remainingFrame = remainingFrame.multiply(BigDecimal.ONE.subtract(BigDecimal.ONE.divide(ticksThisFrame, MathContext.DECIMAL128))).round(MathContext.DECIMAL128);
+                    if (remainingFrame.compareTo(lastRemainingFrame) >= 0) {
+                        throw new IllegalStateException("remainingFrame >= lastRemainingFrame");
+                    }
+                } else {
+                    residual = residual.add(ticksThisFrame);
+                    break;
+                }
+            }
+
+            int roundedResidual = residual.intValue();
+            residual = residual.subtract(BigDecimal.valueOf(roundedResidual));
+            currentTick += roundedResidual;
+
+            if (currentTick >= count) {
+                break;
+            }
+
+            double currentTickDouble = currentTick + residual.doubleValue();
+            if (roundedResidual > 0 && currentTickDouble % 1.0 == 0.0) {
+                residual = BigDecimal.ZERO;
+            }
+
+            // Sanity checks to make sure we don't get into an infinite loop
+            if (roundedResidual < 0) {
+                throw new IllegalStateException("roundedResidual < 0");
+            } else if (roundedResidual == 0 && residual.compareTo(lastResidual) <= 0) {
+                throw new IllegalStateException("roundedResidual == 0 && residual <= lastResidual)");
+            }
+            lastResidual = residual;
+
+            if (!capture.frozen) {
+                startFrozen = -1;
+                ticks.add(new TickInfo(currentTickDouble, currentTickDouble, false));
+            } else {
+                if (startFrozen < 0) {
+                    startFrozen = currentTick;
+                }
+
+                if (capture.frozenDelay == 0) {
+                    ticks.add(new TickInfo(currentTickDouble, Math.min(currentTickDouble, startFrozen), true));
+                    continue;
+                }
+
+                double deltaFromStart = currentTickDouble - startFrozen;
+                double freezeClientTicks = capture.frozenDelay <= 5 ? 0.999 : 1.999;
+                double freezeDerivative = capture.frozenDelay <= 5 ? 1.0 : 0.5;
+                if (deltaFromStart > capture.frozenDelay) {
+                    ticks.add(new TickInfo(currentTickDouble, Math.min(currentTickDouble, startFrozen + freezeClientTicks), true));
+                } else if (capture.frozenDelay == 1) {
+                    ticks.add(new TickInfo(currentTickDouble, Math.min(currentTickDouble, startFrozen + freezeClientTicks), false));
+                } else {
+                    double freezePowerBase = FreezeSlowdownFormula.getFreezePowerBase(capture.frozenDelay, freezeDerivative);
+                    double clientTicks = freezeClientTicks * FreezeSlowdownFormula.calculateFreezeClientTick(deltaFromStart, capture.frozenDelay, freezePowerBase);
+                    ticks.add(new TickInfo(currentTickDouble, Math.min(currentTickDouble, startFrozen + clientTicks), false));
+                }
+            }
+        }
+
+        return ticks;
+    }
+
+
+}

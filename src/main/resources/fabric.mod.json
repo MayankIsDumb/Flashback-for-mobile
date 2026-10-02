@@ -1,0 +1,47 @@
+{
+	"schemaVersion": 1,
+	"id": "flashback",
+	"version": "${version}",
+	"name": "Flashback",
+	"description": "Record your gameplay, view the recordings and export cinematic shots",
+	"authors": [
+		"Moulberry"
+	],
+	"contact": {
+		"homepage": "https://flashback.moulberry.com/",
+		"sources": "https://github.com/Moulberry/Flashback"
+	},
+	"license": "https://github.com/Moulberry/Flashback/blob/master/LICENSE.md",
+	"icon": "assets/flashback/icon.png",
+	"environment": "client",
+	"entrypoints": {
+		"main": [
+			"com.moulberry.flashback.Flashback"
+		],
+		"client": [
+			"com.moulberry.flashback.Flashback"
+		],
+		"frex_flawless_frames": [
+			"com.moulberry.flashback.exporting.FrexFlawlessFramesIntegration"
+		],
+		"modmenu": [
+			"com.moulberry.flashback.FlashbackModMenuApiImpl"
+		],
+        "voicechat": [
+            "com.moulberry.flashback.compat.simple_voice_chat.SimpleVoiceChatPlugin"
+        ]
+	},
+	"accessWidener": "flashback.accesswidener",
+	"mixins": [
+		"flashback.mixins.json"
+	],
+    "breaks": {
+        "voicechat": "<2.6.22"
+    },
+	"depends": {
+		"fabricloader": ">=0.15.10",
+		"minecraft": ">=1.21.11 <21.6",
+		"java": ">=21",
+		"fabric-api": ">=0.107.0"
+	}
+}
