@@ -44,16 +44,23 @@ LEGEND: [x] done  [ ] todo  [!] blocked/notes
 [x] recordHotbar=true default on Android only (PC default untouched)
 [ ] Test each on phone: F5 replay, slot switch replay, inventory open replay
 
-=== PHASE 4 — True ImGui via NDK (IN PROGRESS, gui work copy) ===
+=== PHASE 4 — True ImGui via NDK (IN PROGRESS, mobile tree canonical) ===
 [x] NDK r28 toolchain validated (aarch64 API26, system-only NEEDED)
 [x] v1.90.0 JNI sources relocated imgui->imgui.moulberry90 (jnigen regen)
-[x] arm64-v8a .so built (11.7MB, 3883/3883 symbols; only win32hideFromTaskBar absent — guarded by IS_WINDOWS, unreachable on Android)
-[x] x86_64 .so built (11.6MB, identical symbol set)
+[x] Device root-cause #2 (hs_err): JNI FindClass cannot see Knot mod classes on
+    Pojav/Android OpenJDK -> NULL jclass -> GetMethodID SIGSEGV inside libjvm
+    (HotSpot tolerates NULL, this JVM does not). String relocation was necessary
+    but NOT sufficient. Fix: Jni::FindClassWithLoader via cached ClassLoader
+    (InitClassLoader at nInitJni/internal-nInit/ImFontAtlas-nInit/nInitInputTextData),
+    all raw env->FindClass rerouted; stale "imgui/..." strings now zero in .so.
+    Pipeline: imgui-android/build_android.ps1 step 5d + patches/jni_jvm.{h,cpp};
+    per-TU .o compile (all-in-one clang dies silently) + link.
+[x] arm64-v8a + x86_64 .so rebuilt (3883/3883 symbols, loadClass/getClassLoader present)
 [x] Runtime wiring: setupAndroidImGuiNatives() first in onInitializeClient + imgui.library.path
-[x] Jar packaging: assets/flashback/imgui-android/<abi>/*.so confirmed in built jar
+[x] Jar packaging: android-natives/<abi>/*.so -> assets/flashback/imgui-android/<abi>/ confirmed
 [x] GUI-test jar: Flashback-0.39.9-GUI-test-for-MC1.21.11.jar (207MB, 0 errors)
 [ ] DEVICE TEST: open replay on phone -> editor timeline appears (or send new crash log)
-Source: C:\Users\negi6\Desktop\flashback2.0\Flashback-mobile-gui\
+Source: C:\Users\negi6\Desktop\flashback2.0\Flashback-mobile\
 Stable backup untouched: Flashback-0.39.9-mobile-BACKUP-20261002.jar
 
 === FFMPEG TRACK ===
