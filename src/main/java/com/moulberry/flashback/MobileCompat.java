@@ -64,10 +64,144 @@ public final class MobileCompat {
     }
 
     public static boolean isImGuiNativeSupported() {
-        if (isAndroid()) {
+        if (!isAndroid()) {
+            return true;
+        }
+        return androidImGuiAbi() != null;
+    }
+
+    public static final String IMGUI_SONAME = "libimgui-moulberry90-java64.so";
+
+    public static String androidImGuiAbi() {
+        String arch = System.getProperty("os.arch", "").toLowerCase(java.util.Locale.ROOT);
+        if (arch.contains("aarch64") || arch.contains("arm64")) {
+            return "arm64-v8a";
+        }
+        if (arch.contains("x86_64") || arch.contains("amd64")) {
+            return "x86_64";
+        }
+        return null;
+    }
+
+    private static volatile boolean androidImGuiNativesStaged = false;
+
+    /**
+     * Internal-storage bin dir for extracted natives. External gameDir storage is
+     * often mounted noexec, which makes dlopen fail — java.io.tmpdir points at the
+     * app's internal cache on launchers (Pojav sets TMPDIR there), which allows
+     * executable mappings. Falls back to gameDir only if tmpdir is unusable.
+     */
+    private static java.nio.file.Path internalBinDir(String abi) {
+        String[] candidates = new String[]{
+            System.getProperty("java.io.tmpdir"),
+            System.getenv("TMPDIR")
+        };
+        for (String base : candidates) {
+            if (base == null || base.isEmpty()) {
+                continue;
+            }
+            try {
+                java.nio.file.Path dir = java.nio.file.Path.of(base, "flashback-imgui", abi);
+                java.nio.file.Files.createDirectories(dir);
+                java.nio.file.Path probe = dir.resolve(".w");
+                try {
+                    java.nio.file.Files.write(probe, new byte[]{0});
+                    java.nio.file.Files.deleteIfExists(probe);
+                    return dir;
+                } catch (Exception ignored) {}
+            } catch (Exception ignored) {}
+        }
+        try {
+            return net.fabricmc.loader.api.FabricLoader.getInstance().getGameDir()
+                .resolve("flashback").resolve(".bin").resolve(abi);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    public static synchronized boolean setupAndroidImGuiNatives() {
+        if (!isAndroid()) {
             return false;
         }
-        return true;
+        String abi = androidImGuiAbi();
+        if (abi == null) {
+            return false;
+        }
+        if (androidImGuiNativesStaged && System.getProperty("imgui.library.path") != null) {
+            System.setProperty("imgui.library.name", "imgui-moulberry90-java64");
+            return true;
+        }
+        try {
+            java.net.URL location = MobileCompat.class.getProtectionDomain().getCodeSource().getLocation();
+            java.io.File jarFile = new java.io.File(location.toURI());
+            if (!jarFile.isFile()) {
+                return false;
+            }
+            String[] prefixes = {
+                "assets/flashback/imgui-android/" + abi + "/",
+                "android-natives/" + abi + "/"
+            };
+            java.nio.file.Path binDir = internalBinDir(abi);
+            if (binDir == null) {
+                return false;
+            }
+            java.nio.file.Files.createDirectories(binDir);
+            java.nio.file.Path soOut = binDir.resolve(IMGUI_SONAME);
+            boolean found = false;
+            try (java.util.zip.ZipFile zip = new java.util.zip.ZipFile(jarFile)) {
+                java.util.Enumeration<? extends java.util.zip.ZipEntry> entries = zip.entries();
+                while (entries.hasMoreElements()) {
+                    java.util.zip.ZipEntry entry = entries.nextElement();
+                    if (entry.isDirectory()) {
+                        continue;
+                    }
+                    String name = entry.getName();
+                    boolean match = false;
+                    for (String prefix : prefixes) {
+                        if (name.equals(prefix + IMGUI_SONAME)) {
+                            match = true;
+                            break;
+                        }
+                    }
+                    if (!match) {
+                        continue;
+                    }
+                    try (java.io.InputStream in = zip.getInputStream(entry)) {
+                        java.nio.file.Files.copy(in, soOut, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                    }
+                    found = true;
+                    break;
+                }
+            }
+            if (!found || !java.nio.file.Files.exists(soOut) || java.nio.file.Files.size(soOut) == 0) {
+                return false;
+            }
+            soOut.toFile().setExecutable(true, true);
+            // Aliases: ImGui's loader honors imgui.library.name, but other mods may set it
+            // to plain "imgui-java", and the path branch loads the name verbatim (no affixes).
+            // Hardlinks cost no extra space; fall back to copies if linking fails.
+            String[] aliases = new String[]{"imgui-moulberry90-java64", "imgui-java", "libimgui-java.so"};
+            for (String alias : aliases) {
+                try {
+                    java.nio.file.Path link = binDir.resolve(alias);
+                    java.nio.file.Files.deleteIfExists(link);
+                    try {
+                        java.nio.file.Files.createLink(link, soOut);
+                    } catch (Exception linkFailed) {
+                        java.nio.file.Files.copy(soOut, link, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                    }
+                } catch (Exception ignored) {}
+            }
+            System.setProperty("imgui.library.path", binDir.toString());
+            System.setProperty("imgui.library.name", "imgui-moulberry90-java64");
+            androidImGuiNativesStaged = true;
+            Flashback.LOGGER.info("Flashback mobile: staged ImGui native {} ({} bytes) at {}",
+                IMGUI_SONAME, java.nio.file.Files.size(soOut), soOut);
+            return true;
+        } catch (Exception e) {
+            Flashback.LOGGER.warn("Flashback mobile: bundled ImGui native extract failed, editor UI will be disabled", e);
+            return false;
+        }
     }
 
     public static boolean isFFmpegNativeSupported() {

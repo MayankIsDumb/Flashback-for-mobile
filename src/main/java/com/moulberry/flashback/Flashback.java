@@ -238,6 +238,10 @@ public class Flashback implements ModInitializer, ClientModInitializer {
         if (MobileCompat.isPojavBasedLauncher()) {
             Flashback.LOGGER.info("Pojav/Mojo/Zenith (Android) detected: NFD dialogs disabled, FFmpeg exports fall back to PNG sequence");
             MobileCompat.applyMobileConfigDefaults(config);
+            // Android: stage bundled ImGui natives and point ImGui's loader at them.
+            // Must run before any ImGui class loads (ImGui reads imgui.library.path in its static init).
+            // No-op off Android; on failure ReplayUI keeps its imguiUnsupported fallback guard.
+            MobileCompat.setupAndroidImGuiNatives();
         }
 
         if (config.internal.nfdUsePortal) {

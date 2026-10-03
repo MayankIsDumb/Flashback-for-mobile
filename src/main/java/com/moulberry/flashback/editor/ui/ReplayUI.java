@@ -135,6 +135,7 @@ public class ReplayUI {
         }
         initialized = true;
         try {
+            com.moulberry.flashback.MobileCompat.setupAndroidImGuiNatives();
             initInternal();
         } catch (LinkageError | RuntimeException e) {
             imguiUnsupported = true;
